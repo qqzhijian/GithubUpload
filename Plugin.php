@@ -1,39 +1,61 @@
 <?php
+if (!defined('__TYPECHO_ROOT_DIR__')) exit;
+
 /**
- * GitHub 附件上传插件
- *
+ * GithubUpload 插件
+ * 核心功能：
+ * 1. GitHub 附件上传（保留原上传逻辑）
+ * 2. 智能图片URL替换（安全加固版）
+ * 3. 自动判定外链链接，不修改已有完整URL
+ * 
  * @package GithubUpload
- * @author  Xingtu
+ * @author  xingtu
  * @version 1.1.0
  */
 class GithubUpload_Plugin implements Typecho_Plugin_Interface
 {
+    // ========== 基础常量定义 ==========
     const UPLOAD_DIR = '/usr/uploads';
+    const SAFE_ALLOWED_PATH = '/usr/uploads/';
+    const DEBUG_CSS_SAFE = 'margin:1rem;padding:1rem;background:#f8f9fa;border:1px solid #e9ecef;border-radius:4px;font-size:13px;line-height:1.4;';
     
+    // ========== 插件激活/禁用 ==========
     public static function activate()
     {
-        if (!extension_loaded('curl')) {
-            throw new Typecho_Plugin_Exception(_t('需要 curl 扩展'));
-        }
+        // 注册GitHub上传相关钩子
         Typecho_Plugin::factory('Widget_Upload')->uploadHandle = array(__CLASS__, 'uploadHandle');
         Typecho_Plugin::factory('Widget_Upload')->modifyHandle = array(__CLASS__, 'modifyHandle');
         Typecho_Plugin::factory('Widget_Upload')->deleteHandle = array(__CLASS__, 'deleteHandle');
         Typecho_Plugin::factory('Widget_Upload')->attachmentHandle = array(__CLASS__, 'attachmentHandle');
         Typecho_Plugin::factory('Widget_Upload')->attachmentDataHandle = array(__CLASS__, 'attachmentDataHandle');
-        return _t('插件已激活，请设置 GitHub 信息');
+        
+        // 注册URL替换相关钩子
+        Typecho_Plugin::factory('Widget_Abstract_Contents')->contentEx = [__CLASS__, 'parseContentSafe'];
+        Typecho_Plugin::factory('Widget_Abstract_Contents')->excerptEx = [__CLASS__, 'parseContentSafe'];
+        
+        return _t('GithubUpload 插件已激活<br>1. 请配置GitHub上传信息<br>2. URL替换功能默认启用安全校验，不影响现有外链');
     }
-    
+
     public static function deactivate()
     {
-        return _t('插件已禁用');
+        return _t('GithubUpload 插件已禁用');
     }
-    
+
+    // ========== 插件配置面板 ==========
     public static function config(Typecho_Widget_Helper_Form $form)
     {
         // 样式提示
-        echo '<style>.notice{background:#FFF6BF;color:#8A6D3B;padding:.5rem;border-left:4px solid #fbbc05;}</style>';
+        echo '<style>
+            .notice{background:#FFF6BF;color:#8A6D3B;padding:.5rem;border-left:4px solid #fbbc05;margin:1rem 0;}
+            .section-title{margin:2rem 0 1rem;padding-bottom:.5rem;border-bottom:1px solid #eee;font-weight:bold;}
+            .warn-text{color:#dc3545;font-size:.9rem;}
+        </style>';
+        
+        // ========== 第一部分：GitHub上传配置 ==========
+        echo '<h3 class="section-title">📤 GitHub 附件上传配置</h3>';
         echo '<p class="notice">请正确填写以下 GitHub 配置信息，否则上传将失败。</p>';
         
+        // GitHub基础配置
         $github_user = new Typecho_Widget_Helper_Form_Element_Text(
             'githubUser', null, '', _t('GitHub 用户名 *'), _t('您的 GitHub 用户名')
         );
@@ -53,13 +75,15 @@ class GithubUpload_Plugin implements Typecho_Plugin_Interface
         $form->addInput($github_branch);
         
         $github_api_proxy = new Typecho_Widget_Helper_Form_Element_Text(
-            'githubApiProxy', null, 'https://api.github.com/', _t('GitHub API 地址 *'), _t('直接使用 https://api.github.com/ 或通过代理如 https://ghproxy.com/https://api.github.com/')
+            'githubApiProxy', null, 'https://api.github.com/', _t('GitHub API 地址 *'), 
+            _t('直接使用 https://api.github.com/ 或通过代理如 https://ghproxy.com/https://api.github.com/')
         );
         $github_api_proxy->addRule('required', _t('必须填写 API 地址'));
         $form->addInput($github_api_proxy);
         
         $github_proxy = new Typecho_Widget_Helper_Form_Element_Text(
-            'githubProxy', null, 'https://raw.githubusercontent.com/', _t('GitHub 文件访问地址 *'), _t('直接使用 https://raw.githubusercontent.com/ 或通过代理如 https://ghproxy.com/https://raw.githubusercontent.com/')
+            'githubProxy', null, 'https://raw.githubusercontent.com/', _t('GitHub 文件访问地址 *'), 
+            _t('直接使用 https://raw.githubusercontent.com/ 或通过代理如 https://ghproxy.com/https://raw.githubusercontent.com/')
         );
         $github_proxy->addRule('required', _t('必须填写文件访问地址'));
         $form->addInput($github_proxy);
@@ -90,7 +114,7 @@ class GithubUpload_Plugin implements Typecho_Plugin_Interface
             array('save' => '保存到本地', 'notsave' => '不保存到本地'),
             'save',
             _t('本地备份'),
-            _t('保存到本地可保证主题功能正常，GitHub 上传失败时会自动降级为本地文件')
+            _t('<span class="warn-text">注意：</span>保存到本地可保证主题功能正常，GitHub 上传失败时会自动降级为本地文件')
         );
         $form->addInput($if_save);
         
@@ -104,31 +128,72 @@ class GithubUpload_Plugin implements Typecho_Plugin_Interface
         );
         $form->addInput($commit_email);
         
-        $debug = new Typecho_Widget_Helper_Form_Element_Radio(
-            'debug',
+        $github_debug = new Typecho_Widget_Helper_Form_Element_Radio(
+            'githubDebug',
             array('0' => '关闭', '1' => '开启'),
             '0',
-            _t('调试模式'),
-            _t('开启后记录日志到插件目录 debug.log')
+            _t('GitHub上传调试模式'),
+            _t('<span class="warn-text">注意：</span>开启后记录日志到插件目录 debug.log，生产环境请关闭')
         );
-        $form->addInput($debug);
+        $form->addInput($github_debug);
+        
+        // ========== 第二部分：智能URL替换配置 ==========
+        echo '<h3 class="section-title">🔗 智能图片URL替换配置</h3>';
+        echo '<p class="notice"><span class="warn-text">核心特性：</span>仅替换 /usr/uploads/ 纯相对路径，自动忽略已有完整外链（http/https开头）</p>';
+        
+        $proxyPrefix = new Typecho_Widget_Helper_Form_Element_Text(
+            'proxy_url',
+            NULL,
+            'http://ghproxy.net/https://raw.githubusercontent.com/qqzhijian/dianr_cn/refs/heads/master',
+            _t('外链代理前缀 *'),
+            _t('<span class="warn-text">注意：</span>仅支持 http/https 协议地址，系统将自动过滤恶意字符与非法路径')
+        );
+        $proxyPrefix->input->setAttribute('style', 'width:100%;');
+        $proxyPrefix->addRule('required', _t('必须填写外链代理前缀'));
+        $form->addInput($proxyPrefix);
+
+        $runMode = new Typecho_Widget_Helper_Form_Element_Radio(
+            'run_mode',
+            [
+                'proxy'  => _t('外链代理模式（推荐）'),
+                'local'  => _t('本地原始模式（不替换）')
+            ],
+            'proxy',
+            _t('运行模式'),
+            _t('<span class="warn-text">注意：</span>本地模式不做任何URL替换，仅用于安全测试')
+        );
+        $form->addInput($runMode);
+
+        $url_debug = new Typecho_Widget_Helper_Form_Element_Radio(
+            'urlDebug',
+            [
+                '0' => _t('关闭（生产推荐）'),
+                '1' => _t('开启（仅测试）')
+            ],
+            '0',
+            _t('URL替换调试模式'),
+            _t('<span class="warn-text">注意：</span>开启后仅管理员可见调试日志，生产环境请关闭')
+        );
+        $form->addInput($url_debug);
     }
-    
+
     public static function personalConfig(Typecho_Widget_Helper_Form $form) {}
-    
+
+    // ========== 通用方法：获取插件配置 ==========
     private static function getOptions()
     {
         static $options = null;
         if (null === $options) {
-            $options = Helper::options()->plugin('GithubUpload');
+            $options = Helper::options()->plugin('GithubUpload'); // 关键修改：插件名称对应
         }
         return $options;
     }
-    
+
+    // ========== GitHub上传相关方法 ==========
     private static function debugLog($msg, $data = null)
     {
         $options = self::getOptions();
-        if (empty($options->debug) || $options->debug != '1') return;
+        if (empty($options->githubDebug) || $options->githubDebug != '1') return;
         
         $log_file = dirname(__FILE__) . '/debug.log';
         $log_dir = dirname($log_file);
@@ -201,29 +266,21 @@ class GithubUpload_Plugin implements Typecho_Plugin_Interface
         return self::makeUploadDir($path);
     }
     
-    /**
-     * 构建完整的 GitHub 文件 URL
-     */
     private static function buildFullUrl($path)
     {
         $options = self::getOptions();
         $proxy = rtrim($options->githubProxy, '/');
         
-        // 如果 proxy 已经包含完整路径，则直接使用
         if (strpos($proxy, 'raw.githubusercontent.com') !== false) {
             $filePath = '/' . ltrim($path, '/');
             return $proxy . $filePath;
         }
         
-        // 否则构建完整路径
         $base = $proxy . '/https://raw.githubusercontent.com/' . $options->githubUser . '/' . $options->githubRepo . '/refs/heads/' . $options->githubBranch;
         $filePath = '/' . ltrim($path, '/');
         return $base . $filePath;
     }
     
-    /**
-     * 执行 cURL 请求（统一处理）
-     */
     private static function curlRequest($url, $method = 'GET', $headers = array(), $data = null)
     {
         $ch = curl_init();
@@ -232,9 +289,9 @@ class GithubUpload_Plugin implements Typecho_Plugin_Interface
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
         curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
         curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
-        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true); // 自动跟随重定向
-        curl_setopt($ch, CURLOPT_MAXREDIRS, 5); // 最大重定向次数
-        curl_setopt($ch, CURLOPT_TIMEOUT, 30); // 超时时间
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        curl_setopt($ch, CURLOPT_MAXREDIRS, 5);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
         
         if ($method === 'PUT') {
             curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'PUT');
@@ -299,7 +356,6 @@ class GithubUpload_Plugin implements Typecho_Plugin_Interface
             return false;
         }
         
-        /* 上传到 GitHub */
         $data = array(
             'message' => 'Upload file ' . $fileName,
             'content' => base64_encode($fileContent),
@@ -318,11 +374,9 @@ class GithubUpload_Plugin implements Typecho_Plugin_Interface
             'Authorization: token ' . $options->githubToken
         );
         
-        // 构建 API URL
         $apiBase = rtrim($options->githubApiProxy, '/');
         $repoPath = '/repos/' . $options->githubUser . '/' . $options->githubRepo . '/contents' . $path_relatively;
         
-        // 判断是否需要添加 https://api.github.com 前缀
         if (strpos($apiBase, 'api.github.com') === false) {
             $apiUrl = $apiBase . '/https://api.github.com' . $repoPath;
         } else {
@@ -339,11 +393,9 @@ class GithubUpload_Plugin implements Typecho_Plugin_Interface
             'curl_error' => $result['error']
         ));
         
-        // 检查上传结果（201 创建成功，200 更新成功）
         if (!in_array($result['http_code'], array(200, 201)) || $result['error']) {
             self::writeErrorLog($path_relatively, '[GitHub][upload][' . $result['http_code'] . '] ' . $result['error']);
             
-            // 如果开启了本地保存，则降级为本地文件
             if ($options->ifSave == 'save') {
                 if (!is_dir($fileDir)) {
                     if (!self::makeUploadDir($fileDir)) {
@@ -366,7 +418,6 @@ class GithubUpload_Plugin implements Typecho_Plugin_Interface
             return false;
         }
         
-        // 如果需要本地保存，同时保存到本地
         if ($options->ifSave == 'save') {
             if (!is_dir($fileDir)) {
                 if (self::makeUploadDir($fileDir)) {
@@ -411,7 +462,6 @@ class GithubUpload_Plugin implements Typecho_Plugin_Interface
             'Authorization: token ' . $options->githubToken
         );
         
-        // 构建 API URL
         $apiBase = rtrim($options->githubApiProxy, '/');
         $repoPath = '/repos/' . $options->githubUser . '/' . $options->githubRepo . '/contents' . $github_path;
         
@@ -450,7 +500,6 @@ class GithubUpload_Plugin implements Typecho_Plugin_Interface
             }
         }
         
-        // 删除本地文件
         if ($options->ifSave == 'save') {
             $localFile = __TYPECHO_ROOT_DIR__ . $path;
             if (file_exists($localFile)) {
@@ -461,9 +510,6 @@ class GithubUpload_Plugin implements Typecho_Plugin_Interface
         return true;
     }
     
-    /**
-     * 获取实际文件访问 URL
-     */
     public static function attachmentHandle($content)
     {
         self::debugLog('attachmentHandle called', $content);
@@ -489,5 +535,131 @@ class GithubUpload_Plugin implements Typecho_Plugin_Interface
         self::debugLog('attachmentDataHandle called', $content);
         $url = self::attachmentHandle($content);
         return file_get_contents($url);
+    }
+
+    // ========== 智能URL替换相关方法 ==========
+    private static function getSafePluginOptions()
+    {
+        $option = self::getOptions();
+
+        return [
+            'proxy_url' => self::filterProxyUrl($option->proxy_url ?? ''),
+            'run_mode'  => in_array($option->run_mode ?? '', ['proxy','local']) ? ($option->run_mode) : 'proxy',
+            'urlDebug'     => $option->urlDebug === '1' ? '1' : '0'
+        ];
+    }
+
+    private static function filterProxyUrl($url)
+    {
+        $url = trim($url);
+        if (!preg_match('#^https?://#i', $url)) {
+            return '';
+        }
+        return preg_replace('#[\x00-\x1F\x7F<>"\']#', '', $url);
+    }
+
+    private static function filterSafePath($path)
+    {
+        $path = str_replace(['../', './', '%00', "\0"], '', $path);
+        return preg_replace('#[^a-z0-9\/_\-.]#i', '', $path);
+    }
+
+    private static function isSafeUrl($url)
+    {
+        if (empty($url)) return false;
+        return filter_var($url, FILTER_VALIDATE_URL) !== false;
+    }
+
+    private static function outputDebug($content, $opt, $log)
+    {
+        if ($opt['urlDebug'] !== '1') return $content;
+
+        if (!Typecho_Widget::widget('Widget_User')->hasLogin()) {
+            return $content;
+        }
+
+        $html = '<div style="' . htmlspecialchars(self::DEBUG_CSS_SAFE, ENT_QUOTES) . '">';
+        $html .= '<strong>📝 imgURL 安全调试面板</strong><br>';
+        $html .= '运行模式：' . htmlspecialchars($opt['run_mode'], ENT_QUOTES) . '<br>';
+        $html .= '替换条数：' . count($log) . '<br>';
+
+        foreach ($log as $item) {
+            $html .= '原相对路径：' . htmlspecialchars($item['orig'], ENT_QUOTES) . '<br>';
+            $html .= '替换后外链：' . $item['safe'] . '<br>';
+        }
+        $html .= '</div>';
+
+        return $content . $html;
+    }
+
+    private static function logError($msg)
+    {
+        $msg = mb_substr(strip_tags($msg), 0, 200);
+        $logDir = __TYPECHO_ROOT_DIR__ . '/usr/uploads/';
+        if (!is_dir($logDir)) mkdir($logDir, 0755, true);
+        
+        file_put_contents(
+            $logDir . 'github_imgurl_safe_error.log',
+            '[' . date('Y-m-d H:i:s') . '] ' . $msg . PHP_EOL,
+            FILE_APPEND | LOCK_EX
+        );
+    }
+
+    public static function parseContentSafe($content, $widget, $lastResult)
+    {
+        $content = $lastResult ?: $content;
+
+        if (trim($content) === '') return $content;
+
+        try {
+            $opt = self::getSafePluginOptions();
+
+            if ($opt['run_mode'] === 'local') {
+                return self::outputDebug($content, $opt, []);
+            }
+
+            // 核心正则：仅匹配 非http/https开头 的 /usr/uploads/ 相对路径
+            // 自动忽略已有外链，不影响现有链接
+            $pattern = '#(src|href)=([\'"])(?!http://|https://|//)(/usr/uploads/[^"\'>\s]+)\2#i';
+
+            $replaceLog = [];
+            $content = preg_replace_callback($pattern, function($m) use ($opt, &$replaceLog) {
+                $attr   = $m[1];
+                $quote  = $m[2];
+                $path   = $m[3];
+
+                // 路径白名单校验
+                if (strpos($path, self::SAFE_ALLOWED_PATH) !== 0) {
+                    return $attr . '=' . $quote . $path . $quote;
+                }
+
+                // 路径安全过滤
+                $path = self::filterSafePath($path);
+
+                // 拼接外链（自动处理末尾斜杠）
+                $targetUrl = rtrim($opt['proxy_url'], '/') . $path;
+
+                // URL合法性校验
+                if (!self::isSafeUrl($targetUrl)) {
+                    return $attr . '=' . $quote . $path . $quote;
+                }
+
+                $replaceLog[] = [
+                    'orig' => $path,
+                    'safe' => htmlspecialchars($targetUrl, ENT_QUOTES)
+                ];
+
+                // 安全输出，防止XSS
+                return $attr . '=' . $quote . htmlspecialchars($targetUrl, ENT_QUOTES) . $quote;
+
+            }, $content);
+
+            $content = self::outputDebug($content, $opt, $replaceLog);
+
+        } catch (Exception $e) {
+            self::logError($e->getMessage());
+        }
+
+        return $content;
     }
 }
